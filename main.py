@@ -47,7 +47,7 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = os.environ.get('BOT_TOKEN', '8970163695:AAG4IjKWTUbq3aJd6hrt9XCB7cKC5kyZ1G4')  # set BOT_TOKEN as an environment variable (never write the token in code)
+TOKEN = os.environ.get('BOT_TOKEN', 'PASTE_NEW_BOT_TOKEN_HERE')  # set BOT_TOKEN as an environment variable (never write the token in code)
 OWNER_ID = int(os.environ.get('OWNER_ID', 6506909666))
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 6506909666))
 YOUR_USERNAME = '@Priyanshu0091' # Replace with your Telegram username (without the @)
@@ -70,9 +70,28 @@ os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
 os.makedirs(IROTECH_DIR, exist_ok=True)
 
 # Initialize bot
+def _retry_after(exc, default=5):
+    try:
+        ra = ((getattr(exc, 'result_json', None) or {}).get('parameters') or {}).get('retry_after')
+        if ra: return int(ra)
+    except Exception: pass
+    m = re.search(r'retry after (\d+)', str(exc))
+    return int(m.group(1)) if m else default
+
+class _TgExceptionHandler(telebot.ExceptionHandler):
+    """Keeps polling alive. On Telegram's 429 (too many requests) it waits as long as Telegram asks, then carries on."""
+    def handle(self, exception):
+        if getattr(exception, 'error_code', None) == 429:
+            wait = min(_retry_after(exception) + 1, 120)
+            logger.warning(f"Telegram rate limit (429): waiting {wait}s")
+            time.sleep(wait)
+        else:
+            logger.error(f"Handled TeleBot error: {type(exception).__name__}: {exception}")
+        return True
+
 if 'PASTE_' in TOKEN:
     sys.exit('❌ BOT_TOKEN is not set. Create a new token in @BotFather and set it as the BOT_TOKEN environment variable.')
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4, exception_handler=_TgExceptionHandler())
 
 # ===== small-caps font (ᴀʙᴄᴅᴇ…) for every message, caption and button =====
 _SC_MAP = dict(zip('abcdefghijklmnopqrstuvwxyz', 'ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ'))
@@ -138,6 +157,39 @@ def _install_text_wrappers():
     bot.edit_message_text, bot.answer_callback_query = edit_w, answer_w
 
 _install_text_wrappers()
+
+_last_send = {}
+def _install_rate_guard():
+    """Spaces messages to the same chat by 0.35 s and retries after Telegram's own 'retry after' on a 429."""
+    def guard(name, chat_pos):
+        orig = getattr(bot, name)
+        def w(*a, **k):
+            chat = k.get('chat_id', a[chat_pos] if len(a) > chat_pos else None)
+            if isinstance(chat, (int, str)):
+                gap = _last_send.get(chat, 0) + 0.35 - time.time()
+                if gap > 0: time.sleep(gap)
+                if len(_last_send) > 5000: _last_send.clear()
+                _last_send[chat] = time.time()
+            for attempt in range(4):
+                try: return orig(*a, **k)
+                except telebot.apihelper.ApiTelegramException as e:
+                    if getattr(e, 'error_code', None) != 429 or attempt == 3: raise
+                    time.sleep(min(_retry_after(e) + 1, 120))
+        setattr(bot, name, w)
+    for name, pos in (('send_message', 0), ('send_photo', 0), ('send_document', 0), ('send_video', 0), ('edit_message_text', 1)):
+        guard(name, pos)
+
+_install_rate_guard()
+
+class _Throttled(Exception):
+    pass
+_new_user_times = []
+def _new_user_alert_ok():
+    """At most 5 'new user' alerts per minute to the owner (a fresh database makes every old user look new)."""
+    now = time.time()
+    _new_user_times[:] = [t for t in _new_user_times if now - t < 60]
+    if len(_new_user_times) >= 5: return False
+    _new_user_times.append(now); return True
 
 # --- Data structures ---
 bot_scripts = {} # Stores info about running scripts {script_key: info_dict}
@@ -670,8 +722,9 @@ def _run_script_generic(kind, script_path, owner_id, user_folder, file_name, msg
         allow_heavy = get_tier_limits(owner_id)['heavy_ok']
 
         # 1) install everything first
+        failed_pkgs = []
         try:
-            if kind == 'py': ensure_python_deps(script_path, user_folder, say, allow_heavy=allow_heavy)
+            if kind == 'py': failed_pkgs = ensure_python_deps(script_path, user_folder, say, allow_heavy=allow_heavy)
             else: ensure_node_deps(user_folder, say)
         except HeavyPackageBlocked as hb:
             say(f"🚫 Heavy package not allowed on the free plan: {hb}\n💎 Premium plans allow heavy packages. Open 💎 Premium Plans.")
@@ -694,7 +747,7 @@ def _run_script_generic(kind, script_path, owner_id, user_folder, file_name, msg
 
             if process.poll() is None:
                 set_autostart(owner_id, file_name, True)
-                say(f"✅ {label} bot '{file_name}' started! (PID: {process.pid})\n📦 All packages ready.")
+                say(f"✅ {label} bot '{file_name}' started! (PID: {process.pid})\n" + (f"⚠️ Could not install: {', '.join(failed_pkgs)} — check the messages above." if failed_pkgs else "📦 All packages ready."))
                 return
 
             # it died right after start
@@ -1556,7 +1609,8 @@ def backup_scheduler():
     while True:
         try:
             last = get_setting('last_backup')
-            if not last or datetime.now() - datetime.fromisoformat(last) >= timedelta(hours=24):
+            has_data = bool(user_files or user_subscriptions)      # a fresh empty server has nothing worth backing up
+            if has_data and (not last or datetime.now() - datetime.fromisoformat(last) >= timedelta(hours=24)):
                 run_backup('automatic 24h')
         except Exception as e:
             logger.error(f"backup_scheduler error: {e}", exc_info=True)
@@ -2451,10 +2505,12 @@ def _logic_send_welcome(message):
     if user_id not in active_users:
         add_active_user(user_id)
         try:
+            if not _new_user_alert_ok(): raise _Throttled()
             owner_notification = (f"🎉 New user!\n👤 Name: {user_name}\n✳️ User: @{user_username or 'N/A'}\n"
                                   f"🆔 ID: `{user_id}`\n📝 Bio: {user_bio}")
             bot.send_message(OWNER_ID, owner_notification, parse_mode='Markdown')
             if photo_file_id: bot.send_photo(OWNER_ID, photo_file_id, caption=f"Pic of new user {user_id}")
+        except _Throttled: logger.info(f"New-user alert for {user_id} skipped (burst of new users).")
         except Exception as e: logger.error(f"⚠️ Failed to notify owner about new user {user_id}: {e}")
 
     file_limit = get_user_file_limit(user_id)
@@ -3607,7 +3663,7 @@ if __name__ == '__main__':
     logger.info("🚀 Starting polling...")
     while True:
         try:
-            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30)
+            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30, skip_pending=True)
         except requests.exceptions.ReadTimeout: logger.warning("Polling ReadTimeout. Restarting in 5s..."); time.sleep(5)
         except requests.exceptions.ConnectionError as ce: logger.error(f"Polling ConnectionError: {ce}. Retrying in 15s..."); time.sleep(15)
         except Exception as e:
